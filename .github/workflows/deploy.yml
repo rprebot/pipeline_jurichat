@@ -3,6 +3,7 @@ name: Deploy to OVH VPS
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -26,5 +27,9 @@ jobs:
             # Activer le venv et mettre a jour les dependances si besoin
             source venv/bin/activate
             pip install -r requirements.txt --quiet
+            pip install -r dashboard/requirements.txt --quiet
+
+            # Redemarrer le dashboard
+            sudo systemctl restart jurichat-dashboard
 
             echo "Deploiement termine: $(date)"
