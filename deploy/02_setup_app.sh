@@ -80,18 +80,20 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') - Pipeline CC terminee"
 SCRIPT
 chmod +x jurichat/run_cc.sh
 
-# Script pour mettre a jour les URLs depuis les sitemaps
+# Script pour mettre a jour les URLs depuis les sitemaps ET les websites
 cat > jurichat/run_update_urls.sh << 'SCRIPT'
 #!/bin/bash
-# Met a jour la liste des URLs a ingerer depuis les sitemaps
+# Met a jour la liste des URLs a ingerer (sitemaps + websites)
 set -euo pipefail
 
 cd /home/ubuntu/jurichat
 source venv/bin/activate
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Mise a jour des URLs depuis les sitemaps"
-
 python update_urls_from_sitemaps.py 2>&1 | tee -a logs/update_urls_$(date +%Y%m%d).log
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Mise a jour des URLs depuis les websites"
+python update_urls_from_website.py 2>&1 | tee -a logs/update_urls_$(date +%Y%m%d).log
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') - Mise a jour terminee"
 SCRIPT

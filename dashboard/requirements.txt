@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+asyncssh
+qdrant-client
+python-dotenv
