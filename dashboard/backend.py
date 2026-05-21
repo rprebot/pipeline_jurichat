@@ -1,17 +1,22 @@
 """
 Dashboard de monitoring JuriChat.
-- Logs SSH en direct (WebSocket)
+- Logs en direct (WebSocket)
 - Stats Qdrant (collections, points)
-- Crons programmés
+- Crons programmes
+- Lancement de pipelines
+
+Mode local (VPS) : utilise subprocess directement.
+Mode distant (Mac) : utilise asyncssh.
+Detecte automatiquement via DASHBOARD_LOCAL=1 ou la presence du dossier /home/ubuntu/jurichat.
 """
 
 import asyncio
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
-import asyncssh
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,10 +39,16 @@ app.add_middleware(
 )
 
 # --- Config ---
+LOCAL_MODE = (
+    os.getenv("DASHBOARD_LOCAL", "").strip() == "1"
+    or Path("/home/ubuntu/jurichat").exists()
+)
+
 VPS_HOST = os.getenv("VPS_HOST", "141.227.133.247")
 VPS_USER = os.getenv("VPS_USER", "ubuntu")
 VPS_KEY_PATH = os.getenv("VPS_KEY_PATH", str(Path.home() / ".ssh" / "id_ed25519_ovh"))
 LOGS_DIR = "/home/ubuntu/jurichat/logs"
+JURICHAT_DIR = "/home/ubuntu/jurichat"
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -50,6 +61,56 @@ COLLECTIONS = [
     "unique_questions_decisions_ca",
 ]
 
+logger.info(f"Dashboard mode: {'LOCAL (VPS)' if LOCAL_MODE else 'DISTANT (SSH)'}")
+
+
+# --- Helpers : execution locale ou distante ---
+async def run_command(cmd: str) -> str:
+    """Execute une commande en local ou via SSH selon le mode."""
+    if LOCAL_MODE:
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode()
+    else:
+        import asyncssh
+        async with asyncssh.connect(
+            VPS_HOST, username=VPS_USER,
+            client_keys=[VPS_KEY_PATH], known_hosts=None,
+        ) as conn:
+            result = await conn.run(cmd, check=False)
+            return result.stdout
+
+
+async def stream_command(cmd: str, websocket: WebSocket):
+    """Stream la sortie d'une commande ligne par ligne vers un WebSocket."""
+    if LOCAL_MODE:
+        proc = await asyncio.create_subprocess_shell(
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        try:
+            async for line in proc.stdout:
+                await websocket.send_json({"line": line.decode().rstrip("\n")})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            proc.kill()
+    else:
+        import asyncssh
+        async with asyncssh.connect(
+            VPS_HOST, username=VPS_USER,
+            client_keys=[VPS_KEY_PATH], known_hosts=None,
+        ) as conn:
+            process = await conn.create_process(cmd)
+            try:
+                async for line in process.stdout:
+                    await websocket.send_json({"line": line.rstrip("\n")})
+            except (WebSocketDisconnect, asyncssh.Error):
+                pass
+            finally:
+                process.kill()
+
 
 def get_qdrant_client():
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=15)
@@ -58,11 +119,9 @@ def get_qdrant_client():
 # --- Qdrant Stats ---
 @app.get("/api/qdrant/stats")
 async def qdrant_stats():
-    """Retourne les stats de chaque collection Qdrant."""
     client = get_qdrant_client()
     results = []
 
-    # Lister toutes les collections existantes
     try:
         existing = {c.name for c in client.get_collections().collections}
     except Exception as e:
@@ -89,107 +148,68 @@ async def qdrant_stats():
 # --- Crons ---
 @app.get("/api/crons")
 async def get_crons():
-    """Recupere la crontab du VPS."""
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            result = await conn.run("crontab -l", check=True)
-            lines = result.stdout.strip().split("\n")
+        output = await run_command("crontab -l")
+        lines = output.strip().split("\n")
 
-            crons = []
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    if line.startswith("#") and not line.startswith("# "):
-                        continue
-                    if line.startswith("# "):
-                        crons.append({"type": "comment", "text": line[2:]})
-                    continue
+        crons = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                if line.startswith("# "):
+                    crons.append({"type": "comment", "text": line[2:]})
+                continue
 
-                parts = line.split(None, 5)
-                if len(parts) >= 6:
-                    crons.append({
-                        "type": "job",
-                        "schedule": " ".join(parts[:5]),
-                        "command": parts[5],
-                        "raw": line,
-                    })
+            parts = line.split(None, 5)
+            if len(parts) >= 6:
+                crons.append({
+                    "type": "job",
+                    "schedule": " ".join(parts[:5]),
+                    "command": parts[5],
+                    "raw": line,
+                })
 
-            return {"crons": crons, "raw": result.stdout.strip()}
+        return {"crons": crons, "raw": output.strip()}
 
     except Exception as e:
-        logger.error(f"Erreur SSH crons: {e}")
+        logger.error(f"Erreur crons: {e}")
         return {"error": str(e), "crons": []}
 
 
 # --- Logs disponibles ---
 @app.get("/api/logs/files")
 async def list_log_files():
-    """Liste les fichiers de log disponibles sur le VPS."""
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            result = await conn.run(
-                f"ls -lt {LOGS_DIR}/*.log 2>/dev/null | head -20",
-                check=False,
-            )
-            files = []
-            for line in result.stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-                parts = line.split()
-                if len(parts) >= 9:
-                    filename = parts[-1].split("/")[-1]
-                    size = parts[4]
-                    date = " ".join(parts[5:8])
-                    files.append({"name": filename, "size": size, "date": date})
+        output = await run_command(f"ls -lt {LOGS_DIR}/*.log 2>/dev/null | head -20")
+        files = []
+        for line in output.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 9:
+                filename = parts[-1].split("/")[-1]
+                size = parts[4]
+                date = " ".join(parts[5:8])
+                files.append({"name": filename, "size": size, "date": date})
 
-            return {"files": files}
+        return {"files": files}
 
     except Exception as e:
         return {"error": str(e), "files": []}
 
 
-# --- WebSocket Logs en direct ---
+# --- WebSocket Logs ---
 @app.websocket("/ws/logs/{filename}")
 async def stream_logs(websocket: WebSocket, filename: str):
-    """Stream les logs en direct via WebSocket (tail -f)."""
     await websocket.accept()
 
-    # Securite: empecher path traversal
     if "/" in filename or ".." in filename:
         await websocket.send_json({"error": "Nom de fichier invalide"})
         await websocket.close()
         return
 
-    filepath = f"{LOGS_DIR}/{filename}"
-
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            # Envoyer les 100 dernieres lignes puis suivre
-            process = await conn.create_process(f"tail -n 100 -f {filepath}")
-
-            try:
-                async for line in process.stdout:
-                    await websocket.send_json({"line": line.rstrip("\n")})
-            except (WebSocketDisconnect, asyncssh.Error):
-                pass
-            finally:
-                process.kill()
-
+        await stream_command(f"tail -n 100 -f {LOGS_DIR}/{filename}", websocket)
     except Exception as e:
         try:
             await websocket.send_json({"error": str(e)})
@@ -198,32 +218,12 @@ async def stream_logs(websocket: WebSocket, filename: str):
             pass
 
 
-# --- WebSocket Logs globaux (tous les logs recents) ---
 @app.websocket("/ws/logs")
 async def stream_all_logs(websocket: WebSocket):
-    """Stream tous les logs recents en direct."""
     await websocket.accept()
 
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            # Suivre tous les .log du repertoire
-            process = await conn.create_process(
-                f"tail -n 50 -f {LOGS_DIR}/*.log 2>/dev/null"
-            )
-
-            try:
-                async for line in process.stdout:
-                    await websocket.send_json({"line": line.rstrip("\n")})
-            except (WebSocketDisconnect, asyncssh.Error):
-                pass
-            finally:
-                process.kill()
-
+        await stream_command(f"tail -n 50 -f {LOGS_DIR}/*.log 2>/dev/null", websocket)
     except Exception as e:
         try:
             await websocket.send_json({"error": str(e)})
@@ -235,26 +235,24 @@ async def stream_all_logs(websocket: WebSocket):
 # --- Lancement de pipelines ---
 PIPELINES = {
     "update_urls": (
-        "cd /home/ubuntu/jurichat && source venv/bin/activate && "
+        f"cd {JURICHAT_DIR} && source venv/bin/activate && "
         "python update_urls_from_sitemaps.py && python update_urls_from_website.py"
     ),
     "ingest_blogs": (
-        "cd /home/ubuntu/jurichat && source venv/bin/activate && "
+        f"cd {JURICHAT_DIR} && source venv/bin/activate && "
         "python scrape_and_update_qdrant_collection.py"
     ),
     "ingest_cc": (
-        "cd /home/ubuntu/jurichat && source venv/bin/activate && "
+        f"cd {JURICHAT_DIR} && source venv/bin/activate && "
         "python -m pipeline_ingestion_cour_cassation.main --year {year}"
     ),
 }
 
-# Suivi des pipelines en cours {pipeline_id: {"status": ..., "started_at": ...}}
 running_pipelines: dict = {}
 
 
 @app.post("/api/pipelines/{pipeline_id}/start")
 async def start_pipeline(pipeline_id: str, year: int = 2025):
-    """Lance une pipeline sur le VPS dans un tmux."""
     if pipeline_id not in PIPELINES:
         return {"error": f"Pipeline inconnue: {pipeline_id}"}
 
@@ -265,7 +263,9 @@ async def start_pipeline(pipeline_id: str, year: int = 2025):
     cmd = cmd_template.format(year=year) if "{year}" in cmd_template else cmd_template
 
     session_name = f"pipeline_{pipeline_id}"
-    log_file = f"{LOGS_DIR}/manual_{pipeline_id}_{asyncio.get_event_loop().time():.0f}.log"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"manual_{pipeline_id}_{timestamp}.log"
+    log_file = f"{LOGS_DIR}/{log_filename}"
 
     tmux_cmd = (
         f"tmux kill-session -t {session_name} 2>/dev/null; "
@@ -275,26 +275,19 @@ async def start_pipeline(pipeline_id: str, year: int = 2025):
     )
 
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            await conn.run(tmux_cmd, check=False)
+        await run_command(tmux_cmd)
 
-        from datetime import datetime
         running_pipelines[pipeline_id] = {
             "status": "running",
             "started_at": datetime.now().isoformat(),
-            "log_file": log_file.split("/")[-1],
+            "log_file": log_filename,
             "session": session_name,
         }
 
         return {
             "status": "started",
             "pipeline": pipeline_id,
-            "log_file": log_file.split("/")[-1],
+            "log_file": log_filename,
             "session": session_name,
         }
 
@@ -305,16 +298,9 @@ async def start_pipeline(pipeline_id: str, year: int = 2025):
 
 @app.get("/api/pipelines/status")
 async def pipelines_status():
-    """Verifie le statut des pipelines en cours."""
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            result = await conn.run("tmux list-sessions -F '#{session_name}' 2>/dev/null", check=False)
-            active_sessions = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+        output = await run_command("tmux list-sessions -F '#{session_name}' 2>/dev/null")
+        active_sessions = set(output.strip().split("\n")) if output.strip() else set()
 
         for pid, info in running_pipelines.items():
             if info["status"] == "running" and info["session"] not in active_sessions:
@@ -328,16 +314,9 @@ async def pipelines_status():
 
 @app.post("/api/pipelines/{pipeline_id}/stop")
 async def stop_pipeline(pipeline_id: str):
-    """Arrete une pipeline en cours."""
     session_name = f"pipeline_{pipeline_id}"
     try:
-        async with asyncssh.connect(
-            VPS_HOST,
-            username=VPS_USER,
-            client_keys=[VPS_KEY_PATH],
-            known_hosts=None,
-        ) as conn:
-            await conn.run(f"tmux kill-session -t {session_name} 2>/dev/null", check=False)
+        await run_command(f"tmux kill-session -t {session_name} 2>/dev/null")
 
         if pipeline_id in running_pipelines:
             running_pipelines[pipeline_id]["status"] = "stopped"
@@ -349,14 +328,17 @@ async def stop_pipeline(pipeline_id: str):
 
 
 # --- Servir le frontend ---
+DASHBOARD_DIR = Path(__file__).parent
+
 @app.get("/")
 async def serve_frontend():
-    return FileResponse("dashboard/frontend/index.html")
+    return FileResponse(DASHBOARD_DIR / "frontend" / "index.html")
 
 
-app.mount("/static", StaticFiles(directory="dashboard/frontend"), name="static")
+app.mount("/static", StaticFiles(directory=str(DASHBOARD_DIR / "frontend")), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("dashboard.backend:app", host="127.0.0.1", port=8080, reload=True)
+    host = "0.0.0.0" if LOCAL_MODE else "127.0.0.1"
+    uvicorn.run("dashboard.backend:app", host=host, port=8080, reload=True)
