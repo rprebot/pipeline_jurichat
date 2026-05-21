@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 asyncssh
 qdrant-client
 python-dotenv

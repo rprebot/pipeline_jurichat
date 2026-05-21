@@ -209,7 +209,14 @@ async def stream_logs(websocket: WebSocket, filename: str):
         return
 
     try:
-        await stream_command(f"tail -n 100 -f {LOGS_DIR}/{filename}", websocket)
+        # Attendre que le fichier existe (max 15s)
+        wait_cmd = (
+            f"for i in $(seq 1 30); do "
+            f"[ -f {LOGS_DIR}/{filename} ] && break; "
+            f"sleep 0.5; done; "
+            f"tail -n 100 -f {LOGS_DIR}/{filename}"
+        )
+        await stream_command(wait_cmd, websocket)
     except Exception as e:
         try:
             await websocket.send_json({"error": str(e)})
